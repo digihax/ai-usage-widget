@@ -1,0 +1,9 @@
+config.json
+usage-data.json
+*.log
+__pycache__/
+.private/
+dist/
+evidence/
+HANDOFF.md
+.release/

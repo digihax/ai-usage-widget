@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {
+      "name": "local",
+      "type": "local",
+      "codex_home": "~/.codex",
+      "quota_file": "~/.config/ai-usage-widget/quotas.json"
+    }
+  ],
+  "refresh_seconds": 60
+}
