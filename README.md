@@ -6,6 +6,11 @@ and time until reset. Adapted from a personal multi-machine overlay.
 One source by default. Optional additional sources. No dashboard, web server,
 telemetry, account credentials, paid API calls, or lab infrastructure required.
 
+![Claude and Codex usage badges on the Windows taskbar](docs/images/ai-usage-widget.png)
+
+_Example taskbar display showing weekly percent used and the time remaining until
+each provider's current window resets._
+
 ## Current support
 
 - **Display:** Windows, PowerShell 7, multiple monitors; taskbar gap placement with
