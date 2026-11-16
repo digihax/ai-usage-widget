@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import collect
 
@@ -67,5 +68,61 @@ class Quotas(unittest.TestCase):
             p=Path(folder)/'snapshot.json'
             collect.atomic_json(p,{'codex':self.q})
             self.assertEqual(collect.read_json(p)['codex']['used_percent'],42)
+
+
+class ClaudeRefresh(unittest.TestCase):
+    NOW = dt.datetime.fromisoformat('2026-10-16T00:35:00+00:00').timestamp()
+    TEXT = '''You are currently using your subscription to power your Claude Code usage
+Current session: 1% used � resets Oct 15, 5:59pm (America/Phoenix)
+Current week (all models): 90% used � resets Oct 18, 6:59am (America/Phoenix)
+Current week (Fable): 0% used � resets Oct 18, 7am (America/Phoenix)
+'''
+
+    def test_native_usage_parses_weekly_and_session_windows(self):
+        value = collect.parse_claude_usage(self.TEXT,self.NOW)
+        self.assertEqual(value['used_percent'],90)
+        self.assertEqual(value['five_hour']['used_percent'],1)
+        self.assertEqual(value['observation_kind'],'native_cli')
+        self.assertEqual(collect.parse_claude_usage(self.TEXT.replace('�','\u00b7'),self.NOW)['used_percent'],90)
+
+    def test_refresh_is_throttled_and_preserves_verified_reading(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);quota=root/'quotas.json';state=root/'state'
+            with patch('collect.native_claude_usage',return_value=self.TEXT) as native:
+                self.assertEqual(collect.refresh_claude(quota,state,'unused',now=lambda:self.NOW)['status'],'ok')
+                saved=quota.read_bytes()
+                self.assertEqual(collect.refresh_claude(quota,state,'unused',now=lambda:self.NOW+60)['status'],'throttled')
+                self.assertEqual(native.call_count,1)
+            self.assertEqual(quota.read_bytes(),saved)
+
+    def test_native_command_must_prove_zero_cost_and_turns(self):
+        with tempfile.TemporaryDirectory() as folder:
+            def run(args,**kwargs):
+                self.assertIn('--no-session-persistence',args)
+                self.assertEqual(args[args.index('--tools')+1],'')
+                sid=args[args.index('--session-id')+1]
+                settings=json.loads(Path(args[args.index('--settings')+1]).read_text())
+                self.assertEqual(settings['hooks']['UserPromptSubmit'][0]['hooks'][0]['onFailure'],'block')
+                kwargs['stdout'].write(json.dumps({'type':'result','session_id':sid,
+                    'total_cost_usd':0,'num_turns':0,'result':self.TEXT})+'\n')
+                kwargs['stdout'].flush()
+                return SimpleNamespace(returncode=0)
+            with patch('collect.subprocess.run',side_effect=run):
+                poll=Path(folder)/'poll';poll.mkdir()
+                self.assertEqual(collect.native_claude_usage('unused',poll),self.TEXT)
+
+    def test_local_probe_refreshes_claude_before_reading_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            quota=Path(folder)/'quotas.json'
+            reading={'used_percent':42,'resets_at':time.time()+3600,
+                     'observed_at':dt.datetime.now(dt.timezone.utc).isoformat()}
+            def refresh(path,state,executable):
+                collect.atomic_json(path,{'claude':{'weekly':reading}})
+                return {'status':'ok'}
+            with (patch('collect.find_claude',return_value=Path('claude')),
+                  patch('collect.refresh_claude',side_effect=refresh) as call):
+                result=collect.local_probe({'codex_home':folder,'quota_file':str(quota),'claude_cli':True})
+            self.assertEqual(result['claude']['weekly']['used_percent'],42)
+            call.assert_called_once()
 
 if __name__=='__main__':unittest.main()

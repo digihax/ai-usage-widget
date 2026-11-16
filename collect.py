@@ -7,10 +7,13 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MAX_JSON = 8 * 1024 * 1024
 
@@ -53,7 +56,7 @@ def read_json(path):
 
 
 def normalize(data):
-    """Accept this project's minimal schema or an existing SessionKeeper snapshot."""
+    """Accept this project's minimal schema or a compatible multi-host snapshot."""
     if not isinstance(data, dict):
         raise ValueError('Snapshot must be an object')
     candidates = {'claude': [], 'codex': []}
@@ -113,8 +116,16 @@ def local_probe(options):
                         continue
         except OSError:
             continue
-    result = {'claude': {'weekly': None}, 'codex': {'weekly': choose(candidates)}}
     quota_path = Path(options.get('quota_file', '~/.config/ai-usage-widget/quotas.json')).expanduser()
+    claude_cli = options.get('claude_cli', False)
+    if type(claude_cli) is not bool:
+        raise ValueError('claude_cli must be true or false')
+    if claude_cli:
+        executable = find_claude(options.get('claude_executable'))
+        if executable:
+            state_path = Path(options.get('claude_state', quota_path.parent/'.claude-quota-state')).expanduser()
+            refresh_claude(quota_path, state_path, executable)
+    result = {'claude': {'weekly': None}, 'codex': {'weekly': choose(candidates)}}
     if quota_path.exists():
         cached = normalize(read_json(quota_path))
         for tool in result:
@@ -133,7 +144,7 @@ def probe_source(source):
     host = source['host']
     if not isinstance(host,str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*',host):
         raise ValueError('Use a trusted SSH config alias or user@hostname')
-    options = {k:source[k] for k in ('codex_home','quota_file') if k in source}
+    options = {k:source[k] for k in ('codex_home','quota_file','claude_cli','claude_executable','claude_state') if k in source}
     script = Path(__file__).read_text(encoding='utf8')
     # POSIX remote shell; no config values are interpolated into executable shell text.
     remote = 'python3 - --probe --options ' + shlex.quote(json.dumps(options))
@@ -158,6 +169,183 @@ def atomic_json(path, data):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def find_claude(configured=None):
+    if configured is not None:
+        if not isinstance(configured, str) or not configured.strip():
+            raise ValueError('claude_executable must be a path string')
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+    candidates = []
+    if os.name == 'nt':
+        appdata = Path(os.environ.get('APPDATA', Path.home()/'AppData/Roaming'))
+        candidates.extend((appdata/'npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+                           Path.home()/'.local/bin/claude.exe'))
+    found = shutil.which('claude')
+    if found:
+        candidates.append(Path(found))
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def claude_reset_time(value, zone, now, minutes):
+    try:
+        timezone = ZoneInfo(zone)
+    except ZoneInfoNotFoundError:
+        # Python on Windows may not ship the IANA database. Preserve the original
+        # widget's Phoenix behavior; other zones fail closed until tzdata exists.
+        if zone != 'America/Phoenix':
+            raise ValueError('Install the Python tzdata package for this timezone')
+        timezone = dt.timezone(dt.timedelta(hours=-7))
+    local = dt.datetime.fromtimestamp(now, timezone)
+    values = []
+    for year in (local.year, local.year+1):
+        fmt = '%b %d, ' + ('%I:%M%p' if ':' in value else '%I%p') + ' %Y'
+        try:
+            parsed = dt.datetime.strptime(value+' '+str(year), fmt)
+        except ValueError:
+            continue
+        values.append(parsed.replace(tzinfo=timezone).timestamp())
+    resets = [reset for reset in values if 0 < reset-now <= minutes*60+60]
+    if len(resets) != 1:
+        raise ValueError('Claude reset is expired, ambiguous or outside its window')
+    return int(resets[0])
+
+
+def parse_claude_usage(text, now, previous=None):
+    if not isinstance(text, str) or len(text) > 32768:
+        raise ValueError('Bounded Claude /usage text required')
+    observed = dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat()
+    result = {'source':'Claude CLI /usage (zero inference; displayed reset rounded to minutes)',
+              'observed_at':observed,'observation_kind':'native_cli'}
+    for label,key,minutes in (('Current week (all models)','weekly',10080),
+                              ('Current session','five_hour',300)):
+        sessions = [line for line in text.splitlines() if line.startswith('Current session:')]
+        if key == 'five_hour' and sessions == ['Current session: 0% used']:
+            result[key] = {'state':'not_started','used_percent':0,'observed_at':observed,
+                           'source':result['source']}
+            continue
+        if key == 'five_hour' and not sessions:
+            result[key] = {'state':'not_displayed','observed_at':observed,'source':result['source']}
+            continue
+        pattern = (re.escape(label) + r': (\d+(?:\.\d+)?)% used [\u00b7\u2022\ufffd] resets '
+                   r'([A-Z][a-z]{2} \d{1,2}, \d{1,2}(?::\d{2})?[ap]m) \(([^)]+)\)')
+        matches = re.findall(pattern,text)
+        if len(matches) != 1:
+            raise ValueError('Claude /usage display schema changed: '+key)
+        percent = float(matches[0][0])
+        if not math.isfinite(percent) or not 0 <= percent <= 100:
+            raise ValueError('Invalid Claude percentage')
+        reset = claude_reset_time(matches[0][1],matches[0][2],now,minutes)
+        old = (previous or {}) if key == 'weekly' else (previous or {}).get('five_hour',{})
+        anchor = old.get('resets_at')
+        if isinstance(anchor,(int,float)) and now < anchor <= now+minutes*60 and abs(anchor-reset) <= 60:
+            reset = anchor
+        value = {'resets_at':reset,'used_percent':percent,'observed_at':observed,
+                 'source':result['source'],'reset_precision_seconds':60}
+        if key == 'weekly':
+            result.update(value)
+        else:
+            result[key] = value
+    return result
+
+
+def native_claude_usage(executable, folder):
+    folder.mkdir(parents=True,exist_ok=True,mode=0o700)
+    sid = str(uuid.uuid4())
+    guard = folder/'guard.py'
+    guard.write_text(
+        "import json,sys,uuid\n"
+        "sid=str(uuid.UUID(sys.argv[1]))\n"
+        "value=json.loads(sys.stdin.buffer.read(262145))\n"
+        "if value.get('session_id') != sid: raise SystemExit(2)\n"
+        "print(json.dumps({'continue':False,'stopReason':'Read-only /usage probe; no inference or tools authorized'}))\n",
+        encoding='utf8')
+    parts = [sys.executable,str(guard),sid]
+    command = subprocess.list2cmdline(parts) if os.name == 'nt' else shlex.join(parts)
+    settings = folder/'settings.json'
+    atomic_json(settings,{'hooks':{event:[{'hooks':[{'type':'command','command':command,
+        'timeout':10,'onFailure':'block'}]}] for event in ('UserPromptSubmit','PreToolUse')}})
+    output,error = folder/'output.jsonl',folder/'stderr.log'
+    args = [str(executable),'-p','--session-id',sid,'--no-session-persistence',
+            '--output-format','stream-json','--verbose','--strict-mcp-config',
+            '--mcp-config','{"mcpServers":{}}','--tools','','--max-turns','1',
+            '--max-budget-usd','0.01','--settings',str(settings),'/usage']
+    with output.open('x',encoding='utf8') as stdout,error.open('x',encoding='utf8') as stderr:
+        completed = subprocess.run(args,cwd=folder,stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,
+            timeout=45,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    if output.stat().st_size > 262144:
+        raise ValueError('Claude quota output exceeds review bound')
+    results = []
+    for line in output.read_text(encoding='utf8').splitlines():
+        row = json.loads(line)
+        if row.get('session_id') not in (None,sid):
+            raise ValueError('Claude quota identity mismatch')
+        if row.get('type') == 'result':
+            results.append(row)
+    if (completed.returncode or len(results) != 1 or results[0].get('is_error')
+            or type(results[0].get('total_cost_usd')) not in (int,float)
+            or results[0]['total_cost_usd'] != 0
+            or type(results[0].get('num_turns')) is not int or results[0]['num_turns'] != 0):
+        raise ValueError('Claude quota collection did not prove zero inference/cost')
+    return results[0].get('result')
+
+
+def _refresh_claude(quota_path,state_root,executable,now=time.time):
+    current = now()
+    state_path = state_root/'state.json'
+    try:
+        state = read_json(state_path) if state_path.exists() else {}
+    except (OSError,ValueError):
+        state = {}
+    if not isinstance(state,dict):
+        state = {}
+    if 0 <= current-state.get('attempted_at',0) < 900:
+        return {'status':'throttled'}
+    state = {'attempted_at':current,'status':'pending'}
+    atomic_json(state_path,state)
+    try:
+        with tempfile.TemporaryDirectory(prefix='poll-',dir=state_root) as temporary:
+            text = native_claude_usage(executable,Path(temporary))
+        old = read_json(quota_path) if quota_path.exists() else {}
+        if not isinstance(old,dict):
+            old = {}
+        observation = parse_claude_usage(text,now(),old.get('claude'))
+        old['claude'] = observation
+        atomic_json(quota_path,old)
+        state.update(status='ok',observed_at=observation['observed_at'])
+    except Exception as error:
+        state.update(status='failed',error_type=type(error).__name__,error_reason=str(error)[:200])
+    atomic_json(state_path,state)
+    return {key:state[key] for key in ('status','observed_at','error_type') if key in state}
+
+
+def refresh_claude(quota_path,state_root,executable,now=time.time):
+    state_root = Path(state_root)
+    state_root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (state_root/'poll.lock').open('a+b') as lock:
+        if os.name == 'nt':
+            import msvcrt
+            if lock.seek(0,2) == 0:
+                lock.write(b'0');lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+            except OSError:
+                return {'status':'busy'}
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except OSError:
+                return {'status':'busy'}
+        try:
+            return _refresh_claude(Path(quota_path),state_root,executable,now)
+        finally:
+            if os.name == 'nt':
+                lock.seek(0);msvcrt.locking(lock.fileno(),msvcrt.LK_UNLCK,1)
+            else:
+                fcntl.flock(lock.fileno(),fcntl.LOCK_UN)
 
 
 def collect(config, previous=None):
